@@ -1,18 +1,17 @@
-import hmac
 import html
 import json
 
 import streamlit as st
 import streamlit.components.v1 as components
 
-from knowledge import add_knowledge, index_csc_service_guides
+from knowledge import add_knowledge, add_pdf_knowledge
 from mas_engine import ask
 from voice_assistant import (
-    configured_secret,
     normalize_voice_language,
     openai_audio_enabled,
     synthesize_with_openai,
     transcribe_with_whisper,
+    whisper_stt_enabled,
 )
 
 try:
@@ -30,11 +29,20 @@ st.set_page_config(
 )
 
 
+CSC_LOGO_URL = "https://upload.wikimedia.org/wikipedia/en/thumb/f/f2/Common_Service_Centres_Logo.svg/512px-Common_Service_Centres_Logo.svg.png"
+
 QUICK_PROMPTS = (
-    ("PM Kisan", "PM Kisan registration ka process batao"),
-    ("PAN", "PAN correction process batao"),
-    ("DigiPay", "How to use DigiPay for cash withdrawal"),
-    ("e-Shram", "e-Shram registration ke liye documents kya hain"),
+    ("🌾 PM Kisan", "PM Kisan registration ka process batao"),
+    ("🪪 PAN", "PAN correction process batao"),
+    ("💳 DigiPay", "How to use DigiPay for cash withdrawal"),
+    ("👷 e-Shram", "e-Shram registration ke liye documents kya hain"),
+)
+
+RECENT_QUESTIONS = (
+    "PM Kisan registration",
+    "PAN correction",
+    "DigiPay settlement",
+    "Ayushman card",
 )
 
 
@@ -54,6 +62,8 @@ def _init_state():
         "last_audio_id": "",
         "tts_audio": {},
         "autoplay_message_id": None,
+        "show_ingestion": False,
+        "sidebar_quick_query": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -102,8 +112,8 @@ def _apply_css():
     }
 
     .block-container {
-        max-width: 1040px;
-        padding-top: 1.2rem;
+        max-width: 900px;
+        padding-top: 2.1rem;
         padding-bottom: 3rem;
     }
 
@@ -113,20 +123,12 @@ def _apply_css():
     }
 
     .app-hero {
-        align-items: center;
-        background: linear-gradient(135deg, #ffffff 0%, #f7fbff 55%, #fff7ed 100%);
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        display: flex;
-        justify-content: space-between;
-        gap: 20px;
-        margin-bottom: 16px;
-        padding: 18px 20px;
+        margin: 4px 0 22px 0;
     }
 
     .app-hero h1 {
         color: var(--ink);
-        font-size: 1.75rem;
+        font-size: 1.9rem;
         font-weight: 800;
         letter-spacing: 0;
         line-height: 1.16;
@@ -138,6 +140,49 @@ def _apply_css():
         font-size: .96rem;
         line-height: 1.5;
         margin: 0;
+    }
+
+    .soft-divider {
+        border-top: 1px solid var(--line);
+        margin: 22px 0;
+    }
+
+    .section-label {
+        color: var(--ink);
+        font-size: .9rem;
+        font-weight: 800;
+        margin: 0 0 10px 0;
+    }
+
+    .recent-list {
+        color: #475569;
+        font-size: .94rem;
+        line-height: 1.85;
+        margin-bottom: 10px;
+    }
+
+    .sidebar-brand {
+        margin-bottom: 18px;
+    }
+
+    .sidebar-brand h2 {
+        color: var(--ink);
+        font-size: 1.08rem;
+        font-weight: 800;
+        letter-spacing: 0;
+        line-height: 1.25;
+        margin: 8px 0 0 0;
+    }
+
+    .sidebar-status {
+        background: #ffffff;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        color: #334155;
+        font-size: .86rem;
+        font-weight: 750;
+        line-height: 1.65;
+        padding: 12px;
     }
 
     .hero-badges {
@@ -218,18 +263,38 @@ def _apply_css():
         font-weight: 750;
     }
 
+    div[data-testid="stHorizontalBlock"] .stButton > button {
+        background: #ffffff;
+        border: 1px solid #d8dee8;
+        box-shadow: 0 8px 18px rgba(15, 23, 42, .035);
+    }
+
+    div[data-testid="stHorizontalBlock"] .stButton > button:hover {
+        border-color: var(--csc-blue);
+        color: var(--csc-blue);
+    }
+
     .stButton > button[kind="primary"] {
         background: var(--csc-blue);
         border-color: var(--csc-blue);
     }
 
     .empty-state {
-        background: var(--panel);
-        border: 1px dashed #cbd5e1;
+        background: transparent;
+        border: 0;
         border-radius: 8px;
         color: var(--muted);
-        padding: 28px 20px;
-        text-align: center;
+        padding: 4px 0 12px 0;
+        text-align: left;
+    }
+
+    .ingestion-panel {
+        background: #ffffff;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: 0 16px 34px rgba(15, 23, 42, .08);
+        margin: 12px 0;
+        padding: 16px;
     }
 
     .small-note {
@@ -342,23 +407,12 @@ def _browser_speech_html(text, language_code, autoplay=False):
 """
 
 
-def _admin_secret():
-    return configured_secret("CSC_ADMIN_PASSWORD", "ADMIN_PASSWORD", "ADMIN_PIN")
-
-
 def _render_header():
     st.markdown(
         """
 <div class="app-hero">
-    <div>
-        <h1>CSC AI Assistant</h1>
-        <p>Chat or speak in Hindi and English for CSC service guidance with official-source guardrails.</p>
-    </div>
-    <div class="hero-badges">
-        <span class="hero-badge">Voice input</span>
-        <span class="hero-badge">Voice output</span>
-        <span class="hero-badge">Admin-only ingestion</span>
-    </div>
+    <h1>CSC AI Assistant</h1>
+    <p>Ask questions about CSC services and schemes.</p>
 </div>
 """,
         unsafe_allow_html=True,
@@ -366,23 +420,19 @@ def _render_header():
 
 
 def _render_sidebar():
+    side_query = ""
     with st.sidebar:
-        st.header("Voice")
-        cloud_consent = True
-        voice_mode = st.toggle(
-            "Voice conversation mode",
-            key="voice_mode",
-            help="When on, transcribed speech is sent automatically and the assistant reads the answer aloud.",
+        st.markdown(
+            f"""
+<div class="sidebar-brand">
+    <img src="{CSC_LOGO_URL}" width="86" alt="CSC logo" />
+    <h2>CSC AI Assistant</h2>
+</div>
+""",
+            unsafe_allow_html=True,
         )
-        voice_language = st.selectbox("Voice language", ["Auto", "Hindi", "English"], index=0)
-        response_language = st.selectbox("Response language", ["Auto", "English", "Hindi"], index=0)
-
-        if openai_audio_enabled() and mic_recorder is not None:
-            st.caption("Speech input: OpenAI Whisper. Voice output: browser speech plus optional OpenAI MP3.")
-        elif speech_to_text is not None:
-            st.caption("Speech input: browser Web Speech API. Voice output: browser speech synthesis.")
-        else:
-            st.warning("Install streamlit-mic-recorder to enable microphone input.")
+        cloud_consent = True
+        response_language = st.selectbox("Response Language", ["Auto", "English", "Hindi"], index=0)
 
         if st.button("Clear chat", use_container_width=True):
             st.session_state.messages = []
@@ -392,69 +442,85 @@ def _render_sidebar():
             st.rerun()
 
         st.divider()
-        _render_admin_tools(cloud_consent)
+        st.markdown("**Quick Services**")
+        for label, prompt in QUICK_PROMPTS:
+            if st.button(label, key=f"side_{label}", use_container_width=True):
+                side_query = prompt
 
         st.divider()
-        st.caption("Try: PM Kisan status, PAN correction, DigiPay, Ayushman Bharat, e-Shram registration.")
-
-    return cloud_consent, response_language, voice_language, voice_mode
-
-
-def _render_admin_tools(cloud_consent):
-    st.header("Admin")
-    admin_password = _admin_secret()
-    if not admin_password:
-        st.caption("Set CSC_ADMIN_PASSWORD in Streamlit secrets to enable knowledge ingestion.")
-        return
-
-    if not st.session_state.admin_unlocked:
-        entered = st.text_input("Admin password", type="password")
-        if st.button("Unlock admin tools", use_container_width=True):
-            if hmac.compare_digest(entered or "", admin_password):
-                st.session_state.admin_unlocked = True
-                st.success("Admin tools unlocked.")
-                st.rerun()
-            else:
-                st.error("Invalid admin password.")
-        return
-
-    st.success("Admin tools unlocked.")
-    if st.button("Lock admin tools", use_container_width=True):
-        st.session_state.admin_unlocked = False
-        st.rerun()
-
-    st.subheader("Knowledge Ingestion")
-    source_reviewed = st.checkbox(
-        "I reviewed the source and approve storing embeddings",
-        value=False,
-        help="Only verified official CSC/service URLs should be ingested.",
-    )
-    url_input = st.text_input("Paste CSC or official service URL")
-    can_store = source_reviewed
-
-    if st.button("Add Knowledge", use_container_width=True, disabled=not can_store):
-        if url_input:
-            status = add_knowledge(
-                url_input,
-                cloud_consent=cloud_consent,
-                human_reviewed=source_reviewed,
-            )
-            if "failed" not in status.lower() and "not stored" not in status.lower() and "blocked" not in status.lower():
-                st.success(status)
-            else:
-                st.warning(status)
-        else:
-            st.warning("Paste an allowed CSC or official service URL first.")
-
-    if st.button("Index CSC service guides", use_container_width=True, disabled=not can_store):
-        status = index_csc_service_guides(
-            cloud_consent=cloud_consent,
-            human_reviewed=source_reviewed,
+        st.markdown(
+            """
+<div class="sidebar-status">
+    DPDP Compliant<br />
+    Official Sources Only
+</div>
+""",
+            unsafe_allow_html=True,
         )
-        if "failed" not in status.lower() and "not indexed" not in status.lower() and "not granted" not in status.lower():
-            st.success(status)
-        else:
-            st.warning(status)
+
+    return cloud_consent, response_language, response_language, side_query
+
+
+def _query_admin_mode():
+
+    try:
+        value = st.query_params.get("admin", "")
+    except Exception:
+        value = ""
+
+    return str(value).lower() in {"1", "true", "yes"}
+
+
+def _admin_attachment_visible():
+
+    return st.session_state.admin_unlocked or _query_admin_mode()
+
+
+def _render_ingestion_panel(cloud_consent=True):
+
+    if not st.session_state.show_ingestion or not _admin_attachment_visible():
+        return
+
+    st.markdown(
+        """
+<div class="ingestion-panel">
+    <strong>Add Official Knowledge</strong>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    official_url = st.text_input("Official URL", key="official_ingest_url")
+    uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"], key="official_pdf_upload")
+
+    ingest_col, close_col = st.columns([2, 1])
+    with ingest_col:
+        if st.button("Ingest Knowledge", type="primary", use_container_width=True):
+            if uploaded_pdf:
+                status = add_pdf_knowledge(
+                    uploaded_pdf,
+                    official_url,
+                    cloud_consent=cloud_consent,
+                    human_reviewed=True,
+                )
+            elif official_url:
+                status = add_knowledge(
+                    official_url,
+                    cloud_consent=cloud_consent,
+                    human_reviewed=True,
+                )
+            else:
+                status = "Add an official URL or choose a PDF first."
+
+            if "failed" in status.lower() or "blocked" in status.lower() or "not" in status.lower():
+                st.warning(status)
+            else:
+                st.success(status)
+
+    with close_col:
+        if st.button("Close", use_container_width=True):
+            st.session_state.show_ingestion = False
+            st.rerun()
 
 
 def _render_voice_status():
@@ -508,14 +574,6 @@ def _render_listen_control(message, response_language, voice_mode):
 
 def _render_chat_history(response_language, voice_mode):
     if not st.session_state.messages:
-        st.markdown(
-            """
-<div class="empty-state">
-    Ask a CSC related question, use the microphone, or choose a popular prompt.
-</div>
-""",
-            unsafe_allow_html=True,
-        )
         return
 
     for message in st.session_state.messages:
@@ -523,6 +581,19 @@ def _render_chat_history(response_language, voice_mode):
             st.markdown(message["content"])
             if message["role"] == "assistant":
                 _render_listen_control(message, response_language, voice_mode)
+
+
+def _recent_questions():
+
+    user_questions = [
+        item.get("content", "").strip()
+        for item in st.session_state.messages
+        if item.get("role") == "user" and item.get("content", "").strip()
+    ]
+    if user_questions:
+        return user_questions[-4:][::-1]
+
+    return RECENT_QUESTIONS
 
 
 def _queue_voice_transcript(transcript, voice_mode):
@@ -545,7 +616,29 @@ def _queue_voice_transcript(transcript, voice_mode):
 def _render_microphone(voice_language, voice_mode):
     language_code = normalize_voice_language(voice_language, st.session_state.chat_draft)
 
-    if openai_audio_enabled() and mic_recorder is not None:
+    if speech_to_text is not None and not whisper_stt_enabled():
+        try:
+            transcript = speech_to_text(
+                language=language_code,
+                start_prompt="🎤",
+                stop_prompt="🎤 Listening...",
+                just_once=True,
+                use_container_width=True,
+                key="csc_web_speech",
+            )
+        except TypeError:
+            transcript = speech_to_text(
+                language=language_code,
+                start_prompt="🎤",
+                stop_prompt="🎤 Listening...",
+                just_once=True,
+                key="csc_web_speech",
+            )
+        if transcript and transcript.strip() != st.session_state.last_voice_transcript:
+            _queue_voice_transcript(transcript, voice_mode)
+        return
+
+    if whisper_stt_enabled() and mic_recorder is not None:
         try:
             audio = mic_recorder(
                 start_prompt="🎤",
@@ -569,8 +662,8 @@ def _render_microphone(voice_language, voice_mode):
                 with st.spinner("⚙️ Processing Speech..."):
                     transcript, error = transcribe_with_whisper(audio_bytes, voice_language)
                 if error:
-                    st.warning(error)
                     st.session_state.voice_status = ""
+                    st.toast("⚠ Voice service busy. Please try again in a few seconds.")
                 else:
                     _queue_voice_transcript(transcript, voice_mode)
         return
@@ -611,26 +704,34 @@ def _render_composer(voice_language, voice_mode):
 
     _render_voice_status()
 
-    input_col, mic_col, attach_col, send_col = st.columns([8, 1, 1, 1], vertical_alignment="bottom")
-    with input_col:
-        st.text_area(
-            "Ask CSC related question",
-            key="chat_draft",
-            placeholder="Ask CSC related question...",
-            label_visibility="collapsed",
-            height=78,
-        )
+    st.text_area(
+        "Ask CSC related question",
+        key="chat_draft",
+        placeholder="Ask CSC related question...",
+        label_visibility="collapsed",
+        height=78,
+    )
+
+    admin_visible = _admin_attachment_visible()
+    if admin_visible:
+        mic_col, mode_col, attach_col, spacer_col, send_col = st.columns([1, 2.2, 1, 5.8, 1], vertical_alignment="center")
+    else:
+        mic_col, mode_col, spacer_col, send_col = st.columns([1, 2.2, 6.8, 1], vertical_alignment="center")
 
     with mic_col:
         _render_microphone(voice_language, voice_mode)
 
-    with attach_col:
-        st.button(
-            "📎",
-            disabled=True,
-            use_container_width=True,
-            help="Knowledge uploads are admin-only through the sidebar ingestion tools.",
-        )
+    with mode_col:
+        mode_label = "🎤 Voice Mode ON" if st.session_state.voice_mode else "🎤 Voice Mode OFF"
+        if st.button(mode_label, use_container_width=True, key="inline_voice_mode"):
+            st.session_state.voice_mode = not st.session_state.voice_mode
+            st.rerun()
+
+    if admin_visible:
+        with attach_col:
+            if st.button("📎", use_container_width=True, key="admin_attachment"):
+                st.session_state.show_ingestion = not st.session_state.show_ingestion
+                st.rerun()
 
     with send_col:
         send_clicked = st.button(
@@ -672,9 +773,12 @@ def _build_answer(query, cloud_consent, response_language, voice_mode):
 
 _init_state()
 _apply_css()
-cloud_consent, response_language, voice_language, voice_mode = _render_sidebar()
+cloud_consent, response_language, voice_language, sidebar_query = _render_sidebar()
+voice_mode = st.session_state.voice_mode
 _render_header()
 
+st.markdown('<div class="soft-divider"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-label">Popular Services</div>', unsafe_allow_html=True)
 quick_query = ""
 quick_cols = st.columns(len(QUICK_PROMPTS))
 for index, (label, prompt) in enumerate(QUICK_PROMPTS):
@@ -682,8 +786,17 @@ for index, (label, prompt) in enumerate(QUICK_PROMPTS):
         if st.button(label, use_container_width=True):
             quick_query = prompt
 
+st.markdown('<div class="soft-divider"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-label">Recent Questions</div>', unsafe_allow_html=True)
+recent_items = "\n".join(f"<div>• {_escape(item)}</div>" for item in _recent_questions())
+st.markdown(f'<div class="recent-list">{recent_items}</div>', unsafe_allow_html=True)
+
+if st.session_state.messages:
+    st.markdown('<div class="soft-divider"></div>', unsafe_allow_html=True)
 _render_chat_history(response_language, voice_mode)
-submitted_query = quick_query or _render_composer(voice_language, voice_mode)
+st.markdown('<div class="soft-divider"></div>', unsafe_allow_html=True)
+submitted_query = sidebar_query or quick_query or _render_composer(voice_language, voice_mode)
+_render_ingestion_panel(cloud_consent)
 
 if submitted_query:
     _build_answer(submitted_query, cloud_consent, response_language, voice_mode)

@@ -61,6 +61,14 @@ def openai_audio_enabled():
     return bool(configured_secret("OPENAI_AUDIO_API_KEY", "OPENAI_API_KEY"))
 
 
+def voice_stt_provider():
+    return secret("VOICE_STT_PROVIDER", "browser").strip().lower()
+
+
+def whisper_stt_enabled():
+    return voice_stt_provider() in {"openai", "whisper"} and openai_audio_enabled()
+
+
 def transcribe_with_whisper(audio_bytes, language_choice="Auto"):
     if not audio_bytes:
         return "", "No audio was captured. Please try again."
@@ -87,7 +95,10 @@ def transcribe_with_whisper(audio_bytes, language_choice="Auto"):
     try:
         response = client.audio.transcriptions.create(**kwargs)
     except Exception as exc:
-        return "", f"Speech transcription failed: {exc.__class__.__name__}."
+        error_name = exc.__class__.__name__
+        if "RateLimit" in error_name:
+            return "", "Voice transcription is temporarily busy. Please try again in a moment, or use browser speech input."
+        return "", "Voice transcription could not complete. Please try again or type your question."
 
     text = getattr(response, "text", "") or ""
     return text.strip(), ""
