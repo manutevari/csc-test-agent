@@ -125,7 +125,10 @@ def synthesize_with_openai(text, language_choice="Auto"):
             response_format="mp3",
         )
     except Exception as exc:
-        return None, f"Text-to-speech failed: {exc.__class__.__name__}."
+        error_name = exc.__class__.__name__
+        if "RateLimit" in error_name:
+            return None, "Voice service busy. Please try again in a few seconds."
+        return None, "Voice playback could not complete. Please try again or use browser voice."
 
     if hasattr(response, "read"):
         return response.read(), ""

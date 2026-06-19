@@ -8,6 +8,7 @@ from adaptive_response import detect_response_mode, sections_for_mode
 from builtin_guides import builtin_service_context
 from database import vector_search
 from guardrails import allowed_domains_label, is_allowed_url
+from hitl import queue_human_review
 from service_catalog import official_urls_for_query
 from tavily_search import suggested_csc_urls, tavily_csc_search
 
@@ -78,6 +79,38 @@ HINGLISH_REQUEST_PATTERN = re.compile(
     r"\b(kya|kaise|ka|ki|ke|batao|bataiye|karna|karun|hoga|hai|nahi|yojana|panjikaran|sudhar|praman|seva)\b",
     re.IGNORECASE,
 )
+TOKEN_PATTERN = re.compile(r"[A-Za-z0-9\u0900-\u097F]+")
+DISALLOWED_URL_PATTERN = re.compile(r"https?://[^\s)>\]]+", re.IGNORECASE)
+CONFIDENCE_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "this",
+    "that",
+    "what",
+    "how",
+    "process",
+    "registration",
+    "status",
+    "please",
+    "tell",
+    "batao",
+    "bataiye",
+    "kaise",
+    "kya",
+    "hai",
+    "hoga",
+    "karna",
+    "से",
+    "का",
+    "की",
+    "के",
+    "है",
+    "क्या",
+    "कैसे",
+}
 
 
 def _language(query, response_language="auto"):
@@ -270,6 +303,71 @@ def _with_dpdp_notice(answer, query="", response_language="auto"):
     return f"{notice}\n\n{answer}"
 
 
+def _polish_for_readability(answer, query="", response_language="auto", fast_mode=False):
+
+    clean = (answer or "").strip()
+    if not clean:
+        return clean
+
+    if fast_mode:
+        return clean
+
+    is_hindi = _is_hindi(query, response_language)
+    intro = "ज़रूर। मैं इसे आसान और साफ तरीके से बता देता हूं।" if is_hindi else "Of course. I’ll keep this simple and practical."
+    closing = (
+        "सुरक्षा के लिए personal details केवल official portal पर भरें, chat में नहीं।"
+        if is_hindi
+        else "For safety, enter personal details only on the official portal, not in chat."
+    )
+
+    if clean.startswith(intro):
+        polished = clean
+    else:
+        sections = [section.strip() for section in re.split(r"\n{2,}", clean) if section.strip()]
+        max_sections = _setting_int("FRIENDLY_MAX_SECTIONS", 7)
+        if len(sections) > max_sections:
+            priority_terms = (
+                "Service Name",
+                "सेवा का नाम",
+                "Purpose",
+                "उद्देश्य",
+                "Documents",
+                "दस्तावेज",
+                "DSP",
+                "Form",
+                "फॉर्म",
+                "Workflow",
+                "प्रक्रिया",
+                "Status",
+                "स्टेटस",
+                "Official",
+                "आधिकारिक",
+            )
+            selected = []
+            for term in priority_terms:
+                for section in sections:
+                    if term in section and section not in selected:
+                        selected.append(section)
+                    if len(selected) >= max_sections:
+                        break
+                if len(selected) >= max_sections:
+                    break
+            for section in sections:
+                if section not in selected:
+                    selected.append(section)
+                if len(selected) >= max_sections:
+                    break
+            selected_set = set(selected[:max_sections])
+            sections = [section for section in sections if section in selected_set][:max_sections]
+        polished = intro + "\n\n" + "\n\n".join(sections)
+
+    lowered = polished.lower()
+    if "personal details" not in lowered and "official portal" not in lowered:
+        polished = f"{polished}\n\n{closing}"
+
+    return polished
+
+
 def _source_urls(context):
 
     urls = []
@@ -293,6 +391,76 @@ def _official_urls(query, context, limit=5):
             urls.append(url)
 
     return urls[:limit]
+
+
+def _content_terms(text):
+
+    terms = []
+    for token in TOKEN_PATTERN.findall((text or "").lower()):
+        if len(token) < 3 or token in CONFIDENCE_STOPWORDS:
+            continue
+        terms.append(token)
+    return set(terms)
+
+
+def _context_confidence(query, context, urls=None):
+
+    if not context:
+        return 0.0
+
+    query_terms = _content_terms(query)
+    context_terms = _content_terms(context)
+    if not query_terms:
+        overlap_score = 0.35
+    else:
+        overlap_score = len(query_terms & context_terms) / max(1, len(query_terms))
+
+    source_score = 0.14 if urls else 0.0
+    length_score = min(len(context) / 2400, 1.0) * 0.16
+    return min(0.99, overlap_score * 0.60 + source_score + length_score)
+
+
+def _hitl_message(ticket_id=None, response_language="auto", query=""):
+
+    reference = f" Review ID: CSC-HITL-{ticket_id}." if ticket_id else ""
+    if _is_hindi(query, response_language):
+        return (
+            "मैं सही जानकारी सुनिश्चित करना चाहता हूं, इसलिए यह सवाल human review queue में भेज दिया गया है।"
+            f"{reference} कृपया थोड़ा इंतजार करें या service का process, documents, fee/status जैसे छोटे हिस्से में सवाल पूछें।"
+        )
+
+    return (
+        "I want to make sure you get accurate guidance, so I have sent this question to the human review queue."
+        f"{reference} You may also ask a smaller question about process, documents, fee, or status."
+    )
+
+
+def _route_to_human(query, context, draft_response="", reason="", confidence=0.0, response_language="auto"):
+
+    ticket_id = queue_human_review(
+        query=query,
+        retrieved_context=context,
+        draft_response=draft_response,
+        reason=reason,
+        confidence=confidence,
+    )
+    return _hitl_message(ticket_id, response_language=response_language, query=query)
+
+
+def _output_guardrail_issue(answer, context):
+
+    for url in DISALLOWED_URL_PATTERN.findall(answer or ""):
+        if not is_allowed_url(url.rstrip(".,;")):
+            return "Output contained a non-allowed URL."
+
+    answer_terms = _content_terms(answer)
+    context_terms = _content_terms(context)
+    if len(answer_terms) >= 18 and context_terms:
+        grounded_ratio = len(answer_terms & context_terms) / max(1, len(answer_terms))
+        if grounded_ratio < 0.08:
+            return "Output grounding score was too low."
+
+    return ""
 
 
 def _service_name(context):
@@ -674,26 +842,26 @@ def _voice_local_answer(query, context, response_language="auto"):
     urls = _official_urls(query, context, limit=2)
 
     if _is_hindi(query, response_language):
-        lines = [f"ज़रूर। {service_name} के लिए संक्षेप में:"]
+        lines = [f"ज़रूर। {service_name} के लिए आसान short answer:"]
         if purpose:
             lines.append(purpose)
         if steps:
             lines.append("मुख्य steps: " + "; ".join(steps[:4]))
         if documents:
             lines.append("Documents: " + ", ".join(documents[:4]))
-        lines.append("Personal details सिर्फ official portal पर भरें, chat में नहीं।")
+        lines.append("सुरक्षा के लिए personal details सिर्फ official portal पर भरें, chat में नहीं।")
         if urls:
             lines.append("Official link: " + urls[0])
         return _with_dpdp_notice("\n\n".join(lines), query, response_language)
 
-    lines = [f"Sure. For {service_name}, here is the short version:"]
+    lines = [f"Of course. For {service_name}, here is the short version:"]
     if purpose:
         lines.append(purpose)
     if steps:
         lines.append("Main steps: " + "; ".join(steps[:4]))
     if documents:
         lines.append("Documents: " + ", ".join(documents[:4]))
-    lines.append("Enter personal details only on the official portal, not in chat.")
+    lines.append("For safety, enter personal details only on the official portal, not in chat.")
     if urls:
         lines.append("Official link: " + urls[0])
     return _with_dpdp_notice("\n\n".join(lines), query, response_language)
@@ -811,6 +979,7 @@ def _llm_answer(provider, query, context, history=None, response_language="auto"
     voice_rule = (
         "Voice mode is active. Keep the reply concise: 2 to 5 short sentences or numbered steps, under 90 words when possible. "
         "Use natural Hindi-English code-switching when the user does. Avoid long monologues and read-aloud-unfriendly formatting. "
+        "Sound calm and conversational, as if helping someone at a CSC counter. "
         if fast_mode
         else ""
     )
@@ -832,6 +1001,8 @@ def _llm_answer(provider, query, context, history=None, response_language="auto"
                 "Do not ask for Aadhaar, PAN, phone, bank, password, OTP, health, or child/minor personal data in chat. "
                 "Use a warm, respectful, patient, human-friendly tone. Be polite in every answer, especially when refusing unsafe or unsupported requests. "
                 f"{voice_rule}"
+                "Avoid overwhelming the user. Put the most useful answer first, keep sections compact, and use short sentences with simple words. "
+                "Do not add long motivational text; one gentle reassurance is enough. "
                 "Explain like a Class 8 student can understand: short sentences, simple words, and numbered steps. "
                 f"Detected response mode is: {response_mode}. Adapt the answer to this mode: overview stays short; DSP training emphasizes navigation/workflow; form filling emphasizes fields/documents/validation; troubleshooting emphasizes errors/causes/resolutions; documentation emphasizes documents/fees/eligibility; circular mode emphasizes official policy/circular updates; comparison mode compares only items present in context; catalog mode summarizes categories. "
                 "Return only the final answer in this format, omitting unavailable sections: "
@@ -947,7 +1118,9 @@ def _local_chatbot_answer(query, context, reason, response_language="auto", fast
     if context:
         if fast_mode:
             return _voice_local_answer(query, context, response_language)
-        return _with_dpdp_notice(_structured_answer(query, context, response_language), query, response_language)
+        answer = _structured_answer(query, context, response_language)
+        answer = _polish_for_readability(answer, query, response_language, fast_mode=fast_mode)
+        return _with_dpdp_notice(answer, query, response_language)
 
     return _guardrail_refusal(reason, query=query, response_language=response_language)
 
@@ -993,8 +1166,43 @@ def ask(query, cloud_consent=False, history=None, response_language="auto", fast
             )
 
     sensitive_text = f"{query}\n{context}"
+    safe_official_urls = _official_urls(query, context)
+    confidence = _context_confidence(query, context, safe_official_urls)
+
+    if _flag("HITL_ENABLED", True) and confidence < _setting_float("HITL_CONFIDENCE_THRESHOLD", 0.35):
+        draft = _local_chatbot_answer(
+            query,
+            context,
+            "Retrieved context confidence is below the human-review threshold.",
+            response_language=response_language,
+            fast_mode=fast_mode,
+        )
+        return _route_to_human(
+            query,
+            context,
+            draft_response=draft,
+            reason="Low retrieval confidence",
+            confidence=confidence,
+            response_language=response_language,
+        )
 
     if _has_child_data(sensitive_text) and _has_personal_data(sensitive_text) and not _flag("DPDP_ALLOW_CHILD_DATA_CLOUD", False):
+        if _flag("HITL_ROUTE_SENSITIVE_QUERIES", True):
+            draft = _local_chatbot_answer(
+                query,
+                context,
+                "Possible child/minor personal data was detected.",
+                response_language=response_language,
+                fast_mode=fast_mode,
+            )
+            return _route_to_human(
+                query,
+                context,
+                draft_response=draft,
+                reason="Possible child/minor personal data",
+                confidence=confidence,
+                response_language=response_language,
+            )
         return _local_chatbot_answer(
             query,
             context,
@@ -1014,7 +1222,6 @@ def ask(query, cloud_consent=False, history=None, response_language="auto", fast
 
     safe_query = _redact_personal_data(query)
     safe_context = _redact_personal_data(context)
-    safe_official_urls = _official_urls(query, context)
     history_limit = 4 if fast_mode else 8
     safe_history = [
         {
@@ -1044,6 +1251,17 @@ def ask(query, cloud_consent=False, history=None, response_language="auto", fast
         if answer:
             if _contains_internal_terms(answer):
                 continue
+            output_issue = _output_guardrail_issue(answer, safe_context)
+            if output_issue and _flag("HITL_ENABLED", True):
+                return _route_to_human(
+                    query,
+                    context,
+                    draft_response=answer,
+                    reason=output_issue,
+                    confidence=confidence,
+                    response_language=response_language,
+                )
+            answer = _polish_for_readability(answer, query, response_language, fast_mode=fast_mode)
             return _with_dpdp_notice(answer, query, response_language)
 
     return _local_chatbot_answer(

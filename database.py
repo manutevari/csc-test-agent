@@ -1,6 +1,8 @@
 import os
 
 import psycopg2
+from psycopg2 import errors
+from psycopg2.extras import Json
 import streamlit as st
 from openai import OpenAI
 
@@ -110,7 +112,28 @@ def _embedding(text):
     return emb, ""
 
 
-def store_vector(text, source="manual", human_reviewed=False):
+def _legacy_store(cursor, text, vector, source):
+
+    cursor.execute(
+        """
+        INSERT INTO documents (content, embedding, source, reviewed_by_human)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (text, vector, source, True),
+    )
+
+
+def store_vector(
+    text,
+    source="manual",
+    human_reviewed=False,
+    metadata=None,
+    document_id="",
+    parent_id="",
+    chunk_id="",
+    chunk_index=0,
+    category="general",
+):
 
     if not human_reviewed:
         return False, "Knowledge was not stored because human review approval was not granted."
@@ -128,16 +151,39 @@ def store_vector(text, source="manual", human_reviewed=False):
 
     vector = "[" + ",".join(map(str, emb)) + "]"
 
+    metadata = metadata or {}
+
     try:
         with conn:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO documents (content, embedding, source, reviewed_by_human)
-                    VALUES (%s, %s, %s, %s)
-                    """,
-                    (text, vector, source, True),
-                )
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO documents (
+                            content, embedding, source, reviewed_by_human,
+                            document_id, parent_id, chunk_id, chunk_index, category, metadata
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            text,
+                            vector,
+                            source,
+                            True,
+                            document_id,
+                            parent_id,
+                            chunk_id,
+                            chunk_index,
+                            category,
+                            Json(metadata),
+                        ),
+                    )
+                except (errors.UndefinedColumn, errors.InvalidTextRepresentation):
+                    conn.rollback()
+                    _legacy_store(cursor, text, vector, source)
+                except psycopg2.ProgrammingError:
+                    conn.rollback()
+                    _legacy_store(cursor, text, vector, source)
     except psycopg2.Error as exc:
         _safe_log(f"Database insert failed: {exc.__class__.__name__}")
         return False, "Knowledge could not be stored. Check the documents table and pgvector setup."
