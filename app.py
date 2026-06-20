@@ -50,7 +50,6 @@ RECENT_QUESTIONS = (
 
 INGEST_SOURCE_TYPES = ("URL", "PDF", "DOCX", "TXT", "CSV", "XLSX", "PPTX")
 
-
 def _escape(value):
     return html.escape(str(value), quote=True)
 
@@ -63,7 +62,7 @@ def _init_state():
         "voice_status": "",
         "admin_unlocked": False,
         "message_seq": 0,
-        "last_voice_transcript": "
+        "last_voice_transcript": "",
         "last_audio_id": "",
         "autoplay_message_id": None,
         "show_ingestion": False,
@@ -71,6 +70,7 @@ def _init_state():
         "tts_voice_choice": "Bhashini (default)",
         "tts_audio_cache": {},
     }
+
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
@@ -79,7 +79,6 @@ def _init_state():
         if "id" not in message:
             st.session_state.message_seq += 1
             message["id"] = st.session_state.message_seq
-
 
 def _append_message(role, content):
     st.session_state.message_seq += 1
