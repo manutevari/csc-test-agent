@@ -13,6 +13,8 @@ from voice_assistant import (
     normalize_voice_language,
     transcribe_with_whisper,
     whisper_stt_enabled,
+    synthesize_with_openai,
+    openai_audio_enabled,
 )
 
 try:
@@ -61,12 +63,13 @@ def _init_state():
         "voice_status": "",
         "admin_unlocked": False,
         "message_seq": 0,
-        "last_voice_transcript": "",
+        "last_voice_transcript": "
         "last_audio_id": "",
         "autoplay_message_id": None,
         "show_ingestion": False,
         "sidebar_quick_query": "",
         "tts_voice_choice": "Bhashini (default)",
+        "tts_audio_cache": {},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -526,69 +529,17 @@ def _render_header():
     <h1>CSC Mitra</h1>
     <p>Namaste. Ask about CSC services and government schemes in Hindi or English. You will get simple, polite, official-source guidance step by step.</p>
 </div>
+<div style="font-size:0.9rem;color:#6b7280;margin-top:8px;margin-bottom:14px;">DPDP Compliance: This service uses official sources; personal data is handled per policy.</div>
 """,
         unsafe_allow_html=True,
     )
 
 
 def _render_sidebar():
+    # Sidebar removed per user request. Provide default settings programmatically.
     side_query = ""
-    with st.sidebar:
-        st.markdown(
-            f"""
-<div class="sidebar-brand">
-    <h2>CSC AI Assistant</h2>
-    <p>Your trusted CSC ally</p>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-        cloud_consent = True
-        response_language = st.selectbox("Response Language", ["Auto", "English", "Hindi"], index=0)
-
-        # Voice tone selector (human-like voices)
-        voice_tone = st.selectbox(
-            "Voice Tone",
-            ["Bhashini (default)", "OpenAI Nova", "Gemini-like (neural)", "Microsoft Copilot (neural)"],
-            index=0,
-            key="tts_voice_choice",
-        )
-
-        if st.button("Clear chat", use_container_width=True):
-            st.session_state.messages = []
-            st.session_state.chat_draft = ""
-            st.session_state.autoplay_message_id = None
-            st.rerun()
-
-        st.divider()
-        st.markdown("**Quick Services**")
-        for label, prompt in QUICK_PROMPTS:
-            if st.button(label, key=f"side_{label}", use_container_width=True):
-                side_query = prompt
-
-        st.divider()
-        if not _admin_attachment_visible():
-            with st.expander("Admin Access", expanded=False):
-                admin_password = st.text_input("Admin password", type="password", key="admin_password_input")
-                if st.button("Unlock admin tools", use_container_width=True, key="admin_unlock_button"):
-                    expected = guardrail_setting("CSC_ADMIN_PASSWORD", "")
-                    if expected and admin_password == expected:
-                        st.session_state.admin_unlocked = True
-                        st.success("Admin tools unlocked.")
-                        st.rerun()
-                    else:
-                        st.warning("Invalid admin password.")
-
-        st.markdown(
-            """
-<div class="sidebar-status">
-    🔒 DPDP Compliant<br />
-    Verified Official Sources Only
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
+    cloud_consent = True
+    response_language = "Auto"
     return cloud_consent, response_language, response_language, side_query
 
 
@@ -735,9 +686,34 @@ def _render_listen_control(message, response_language, voice_mode):
     voice_tone = st.session_state.get("tts_voice_choice", "Bhashini (default)")
     autoplay = st.session_state.autoplay_message_id == message["id"] and voice_mode
 
+    # If a server-side TTS provider is configured, use it for reliable playback.
+    # Cache generated audio per message id to avoid repeated calls.
+    cache = st.session_state.get("tts_audio_cache", {})
+    cache_key = f"msg_{message.get('id')}"
+    if openai_audio_enabled():
+        audio_bytes = cache.get(cache_key)
+        if not audio_bytes:
+            with st.spinner("Generating voice..."):
+                audio_bytes, err = synthesize_with_openai(content, response_language)
+            if audio_bytes:
+                cache[cache_key] = audio_bytes
+                st.session_state["tts_audio_cache"] = cache
+            else:
+                st.error(f"TTS Error: {err}")
+                # Fallback to browser synthesis below
+        if audio_bytes:
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.audio(audio_bytes, format="audio/mp3")
+            with col2:
+                st.caption(f"🎵 {voice_tone}")
+            st.session_state.autoplay_message_id = None
+            return
+
+    # Fallback to browser speech synthesis (may be blocked by browser autoplay policies)
     components.html(
         _browser_speech_html(content, language_code, voice_tone=voice_tone, autoplay=autoplay),
-        height=44,
+        height=88,
     )
 
     if autoplay:
@@ -785,8 +761,8 @@ def _queue_voice_transcript(transcript, voice_mode):
     st.rerun()
 
 
-def _render_microphone(voice_language, voice_mode):
-    language_code = normalize_voice_language(voice_language, st.session_state.chat_draft)
+def _render_microphone(response_language, voice_mode):
+    language_code = normalize_voice_language(response_language, st.session_state.chat_draft)
 
     # Short, clear prompts for recorder components (avoid emoji images)
     start_prompt_text = "Mic"
@@ -869,7 +845,7 @@ def _render_microphone(voice_language, voice_mode):
     st.button("Mic", disabled=True, use_container_width=True, help="Microphone input needs streamlit-mic-recorder.")
 
 
-def _render_composer(voice_language, voice_mode):
+def _render_composer(response_language, voice_mode):
     if st.session_state.get("voice_prefill"):
         st.session_state.chat_draft = st.session_state.pop("voice_prefill")
         st.session_state.voice_status = ""
@@ -890,16 +866,12 @@ def _render_composer(voice_language, voice_mode):
 
     admin_visible = _admin_attachment_visible()
     if admin_visible:
-        mic_col, mode_col, attach_col, spacer_col, send_col = st.columns([1, 2.2, 1, 5.8, 1], vertical_alignment="center")
+        mic_col, spacer_col, attach_col, send_col = st.columns([1, 5.8, 1, 1], vertical_alignment="center")
     else:
-        mic_col, mode_col, spacer_col, send_col = st.columns([1, 2.2, 6.8, 1], vertical_alignment="center")
+        mic_col, spacer_col, send_col = st.columns([1, 6.8, 1], vertical_alignment="center")
 
     with mic_col:
-        _render_microphone(voice_language, voice_mode)
-
-    with mode_col:
-        # Use a simple toggle checkbox for voice mode instead of an on/off button
-        st.checkbox("Voice Mode", key="voice_mode", help="Toggle voice mode on or off")
+        _render_microphone(response_language, voice_mode)
 
     if admin_visible:
         with attach_col:
@@ -909,7 +881,7 @@ def _render_composer(voice_language, voice_mode):
 
     with send_col:
         send_clicked = st.button(
-            "➤",
+            "Send",
             type="primary",
             use_container_width=True,
             disabled=not st.session_state.chat_draft.strip(),
@@ -951,25 +923,42 @@ cloud_consent, response_language, voice_language, sidebar_query = _render_sideba
 voice_mode = st.session_state.voice_mode
 _render_header()
 
+# Language and Voice Tone Selectors - Simple and Prominent for Accessibility
 st.markdown('<div class="soft-divider"></div>', unsafe_allow_html=True)
-st.markdown('<div class="section-label">Popular Services</div>', unsafe_allow_html=True)
-quick_query = ""
-quick_cols = st.columns(len(QUICK_PROMPTS))
-for index, (label, prompt) in enumerate(QUICK_PROMPTS):
-    with quick_cols[index]:
-        if st.button(label, use_container_width=True):
-            quick_query = prompt
+sel_col1, sel_col2, sel_col3 = st.columns(3, vertical_alignment="center")
+
+with sel_col1:
+    response_language = st.selectbox(
+        "🌐 Language",
+        ["Auto", "English", "Hindi"],
+        index=0,
+        help="Choose response language",
+    )
+
+with sel_col2:
+    voice_tone = st.selectbox(
+        "🎤 Voice Tone",
+        ["Bhashini (default)", "OpenAI Nova", "Gemini-like (neural)", "Microsoft Copilot (neural)"],
+        index=0,
+        key="tts_voice_choice",
+        help="Choose voice type",
+    )
+
+with sel_col3:
+    st.checkbox(
+        "🔊 Voice Mode",
+        key="voice_mode",
+        help="Enable voice responses",
+    )
+    voice_mode = st.session_state.voice_mode
 
 st.markdown('<div class="soft-divider"></div>', unsafe_allow_html=True)
-st.markdown('<div class="section-label">Recent Questions</div>', unsafe_allow_html=True)
-recent_items = "\n".join(f"<div>• {_escape(item)}</div>" for item in _recent_questions())
-st.markdown(f'<div class="recent-list">{recent_items}</div>', unsafe_allow_html=True)
 
 if st.session_state.messages:
-    st.markdown('<div class="soft-divider"></div>', unsafe_allow_html=True)
+    pass  # Messages will be rendered below
 _render_chat_history(response_language, voice_mode)
 st.markdown('<div class="soft-divider"></div>', unsafe_allow_html=True)
-submitted_query = sidebar_query or quick_query or _render_composer(voice_language, voice_mode)
+submitted_query = sidebar_query or _render_composer(response_language, voice_mode)
 _render_ingestion_panel(cloud_consent)
 
 if submitted_query:
