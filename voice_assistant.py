@@ -114,8 +114,28 @@ def synthesize_with_openai(text, language_choice="Auto"):
         return None, "OpenAI text-to-speech is not configured."
 
     client = OpenAI(api_key=api_key)
-    voice = secret("OPENAI_TTS_VOICE", "nova")
-    model = secret("OPENAI_TTS_MODEL", "tts-1")
+
+    # Respect a user-selected voice tone from the Streamlit UI when available.
+    try:
+        ui_choice = st.session_state.get("tts_voice_choice", "").lower()
+    except Exception:
+        ui_choice = ""
+
+    if ui_choice == "bhashini (default)":
+        voice = secret("BHASHINI_VOICE", secret("OPENAI_TTS_VOICE", "nova"))
+        model = secret("BHASHINI_TTS_MODEL", secret("OPENAI_TTS_MODEL", "tts-1"))
+    elif ui_choice == "openai nova":
+        voice = secret("OPENAI_TTS_VOICE", "nova")
+        model = secret("OPENAI_TTS_MODEL", "tts-1")
+    elif ui_choice == "gemini-like (neural)":
+        voice = secret("GEMINI_TTS_VOICE", "alloy")
+        model = secret("OPENAI_TTS_MODEL", "tts-1")
+    elif ui_choice == "microsoft copilot (neural)":
+        voice = secret("MS_TTS_VOICE", "copilot")
+        model = secret("OPENAI_TTS_MODEL", "tts-1")
+    else:
+        voice = secret("OPENAI_TTS_VOICE", "nova")
+        model = secret("OPENAI_TTS_MODEL", "tts-1")
 
     try:
         response = client.audio.speech.create(

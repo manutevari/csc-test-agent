@@ -4,9 +4,11 @@ import json
 import streamlit as st
 import streamlit.components.v1 as components
 
-from knowledge import add_knowledge, add_pdf_knowledge
+from knowledge import ingest_knowledge_source
+from document_extractors import SUPPORTED_FILE_TYPES
 from hitl import list_pending_reviews, resolve_review
 from mas_engine import ask
+from guardrails import setting as guardrail_setting
 from voice_assistant import (
     normalize_voice_language,
     transcribe_with_whisper,
@@ -44,6 +46,8 @@ RECENT_QUESTIONS = (
     "Ayushman card eligibility",
 )
 
+INGEST_SOURCE_TYPES = ("URL", "PDF", "DOCX", "TXT", "CSV", "XLSX", "PPTX")
+
 
 def _escape(value):
     return html.escape(str(value), quote=True)
@@ -62,6 +66,7 @@ def _init_state():
         "autoplay_message_id": None,
         "show_ingestion": False,
         "sidebar_quick_query": "",
+        "tts_voice_choice": "Bhashini (default)",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -315,6 +320,19 @@ def _apply_css():
         padding: 16px;
     }
 
+    .ingest-stage {
+        color: var(--muted);
+        font-size: .9rem;
+        margin: 6px 0 2px 0;
+    }
+
+    .ingest-ready {
+        color: #15803d;
+        font-size: .95rem;
+        font-weight: 600;
+        margin-top: 8px;
+    }
+
     .small-note {
         color: var(--muted);
         font-size: .86rem;
@@ -348,13 +366,14 @@ def _apply_css():
     )
 
 
-def _browser_speech_html(text, language_code, autoplay=False):
+def _browser_speech_html(text, language_code, voice_tone="Bhashini (default)", autoplay=False):
     safe_text = json.dumps(text[:5000]).replace("</", "<\\/")
     safe_lang = json.dumps(language_code)
+    safe_tone = json.dumps(voice_tone)
     auto = "true" if autoplay else "false"
     return f"""
-<button id="listenBtn" type="button" aria-label="Listen to assistant response">🔊 Listen to Response</button>
-<button id="stopBtn" type="button" aria-label="Stop reading assistant response">⏹ Stop</button>
+<button id="listenBtn" type="button" aria-label="Listen to assistant response">Listen to Response</button>
+<button id="stopBtn" type="button" aria-label="Stop reading assistant response">Stop</button>
 <span id="listenStatus" aria-live="polite"></span>
 <style>
     body {{
@@ -402,7 +421,29 @@ def _browser_speech_html(text, language_code, autoplay=False):
     function chooseVoice() {{
         const voices = window.speechSynthesis ? window.speechSynthesis.getVoices() : [];
         const matching = voices.filter((voice) => voice.lang && voice.lang.toLowerCase().startsWith(lang.slice(0, 2).toLowerCase()));
-        const friendly = matching.find((voice) => /natural|neural|google|microsoft|zira|heera|ravi/i.test(voice.name || ""));
+        const tone = {safe_tone}.toLowerCase();
+        const tonePatterns = [];
+
+        if (tone.includes("bhashini")) {{
+            tonePatterns.push(/bhashini|bharat|india|hindi|hindustan/i);
+        }} else if (tone.includes("openai nova")) {{
+            tonePatterns.push(/alloy|nova|natural|english|united states|en-us/i);
+        }} else if (tone.includes("gemini-like")) {{
+            tonePatterns.push(/natural|neural|google|microsoft|zira|ravi|maya|ariel/i);
+        }} else if (tone.includes("microsoft copilot")) {{
+            tonePatterns.push(/microsoft|copilot|zira|ariel|maya|david|chloe/i);
+        }}
+
+        let friendly = null;
+        for (const pattern of tonePatterns) {{
+            friendly = matching.find((voice) => pattern.test(voice.name || ""));
+            if (friendly) break;
+        }}
+
+        if (!friendly) {{
+            friendly = matching.find((voice) => /natural|neural|google|microsoft|zira|heera|ravi/i.test(voice.name || ""));
+        }}
+
         return friendly || matching[0] || voices[0] || null;
     }}
 
@@ -444,12 +485,12 @@ def _browser_speech_html(text, language_code, autoplay=False):
         }}
         const utterance = new SpeechSynthesisUtterance(queue[activeIndex]);
         utterance.lang = lang;
-        utterance.rate = 0.86;
-        utterance.pitch = 1.04;
+        utterance.rate = tone.includes("bhashini") ? 0.92 : 0.86;
+        utterance.pitch = tone.includes("gemini-like") ? 1.08 : 1.04;
         utterance.volume = 1.0;
         const voice = chooseVoice();
         if (voice) utterance.voice = voice;
-        utterance.onstart = () => status.textContent = "Speaking softly...";
+        utterance.onstart = () => status.textContent = "Speaking...";
         utterance.onend = () => {{
             activeIndex += 1;
             window.setTimeout(speakChunk, 140);
@@ -496,7 +537,6 @@ def _render_sidebar():
         st.markdown(
             f"""
 <div class="sidebar-brand">
-    <img src="{CSC_LOGO_URL}" width="86" alt="CSC logo" />
     <h2>CSC AI Assistant</h2>
     <p>Your trusted CSC ally</p>
 </div>
@@ -505,6 +545,14 @@ def _render_sidebar():
         )
         cloud_consent = True
         response_language = st.selectbox("Response Language", ["Auto", "English", "Hindi"], index=0)
+
+        # Voice tone selector (human-like voices)
+        voice_tone = st.selectbox(
+            "Voice Tone",
+            ["Bhashini (default)", "OpenAI Nova", "Gemini-like (neural)", "Microsoft Copilot (neural)"],
+            index=0,
+            key="tts_voice_choice",
+        )
 
         if st.button("Clear chat", use_container_width=True):
             st.session_state.messages = []
@@ -519,6 +567,18 @@ def _render_sidebar():
                 side_query = prompt
 
         st.divider()
+        if not _admin_attachment_visible():
+            with st.expander("Admin Access", expanded=False):
+                admin_password = st.text_input("Admin password", type="password", key="admin_password_input")
+                if st.button("Unlock admin tools", use_container_width=True, key="admin_unlock_button"):
+                    expected = guardrail_setting("CSC_ADMIN_PASSWORD", "")
+                    if expected and admin_password == expected:
+                        st.session_state.admin_unlocked = True
+                        st.success("Admin tools unlocked.")
+                        st.rerun()
+                    else:
+                        st.warning("Invalid admin password.")
+
         st.markdown(
             """
 <div class="sidebar-status">
@@ -555,35 +615,77 @@ def _render_ingestion_panel(cloud_consent=True):
     st.markdown(
         """
 <div class="ingestion-panel">
-    <strong>Add Official Knowledge</strong>
+    <strong>Add Knowledge Source</strong>
+    <div class="small-note">Ingest official CSC documents and government service guidelines into the knowledge base.</div>
 </div>
 """,
         unsafe_allow_html=True,
     )
 
-    official_url = st.text_input("Official URL", key="official_ingest_url")
-    uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"], key="official_pdf_upload")
+    source_type = st.radio(
+        "Source Type",
+        INGEST_SOURCE_TYPES,
+        horizontal=True,
+        key="ingest_source_type",
+    )
+    source_key = source_type.lower()
+
+    official_url = st.text_input(
+        "Official URL",
+        key="official_ingest_url",
+        placeholder="https://pmkisan.gov.in/...",
+    )
+
+    uploaded_file = None
+    if source_key != "url":
+        file_types = SUPPORTED_FILE_TYPES[source_key][0]
+        uploaded_file = st.file_uploader(
+            "Upload File",
+            type=file_types,
+            key=f"official_{source_key}_upload",
+        )
+
+    meta_col1, meta_col2 = st.columns(2)
+    with meta_col1:
+        department = st.text_input("Department (optional)", key="ingest_department", placeholder="Agriculture")
+    with meta_col2:
+        service_type = st.text_input("Service Type (optional)", key="ingest_service", placeholder="PM-KISAN")
+
+    source_name = st.text_input(
+        "Source Name (optional)",
+        key="ingest_source_name",
+        placeholder="PM-KISAN Operational Guidelines",
+    )
+
+    progress_bar = st.progress(0)
+    stage_label = st.empty()
 
     ingest_col, close_col = st.columns([2, 1])
     with ingest_col:
-        if st.button("Ingest Knowledge", type="primary", use_container_width=True):
-            if uploaded_pdf:
-                status = add_pdf_knowledge(
-                    uploaded_pdf,
-                    official_url,
-                    cloud_consent=cloud_consent,
-                    human_reviewed=True,
-                )
-            elif official_url:
-                status = add_knowledge(
-                    official_url,
-                    cloud_consent=cloud_consent,
-                    human_reviewed=True,
-                )
-            else:
-                status = "Add an official URL or choose a PDF first."
+        if st.button("Ingest", type="primary", use_container_width=True):
+            def _on_progress(stage, percent):
+                progress_bar.progress(min(max(float(percent), 0.0), 1.0))
+                if stage == "Knowledge Ready":
+                    stage_label.markdown('<div class="ingest-ready">✓ Knowledge Ready</div>', unsafe_allow_html=True)
+                else:
+                    stage_label.markdown(f'<div class="ingest-stage">{stage}...</div>', unsafe_allow_html=True)
 
-            if "failed" in status.lower() or "blocked" in status.lower() or "not" in status.lower():
+            _on_progress("Uploading", 0.05)
+
+            status = ingest_knowledge_source(
+                source_key,
+                official_url=official_url.strip(),
+                uploaded_file=uploaded_file,
+                cloud_consent=cloud_consent,
+                human_reviewed=True,
+                department=department.strip(),
+                service_type=service_type.strip(),
+                source_name=source_name.strip(),
+                progress_callback=_on_progress,
+            )
+
+            lowered = status.lower()
+            if "failed" in lowered or "blocked" in lowered or "not stored" in lowered or "could not" in lowered:
                 st.warning(status)
             else:
                 st.success(status)
@@ -630,10 +732,11 @@ def _render_voice_status():
 def _render_listen_control(message, response_language, voice_mode):
     content = message["content"]
     language_code = normalize_voice_language(response_language, content)
+    voice_tone = st.session_state.get("tts_voice_choice", "Bhashini (default)")
     autoplay = st.session_state.autoplay_message_id == message["id"] and voice_mode
 
     components.html(
-        _browser_speech_html(content, language_code, autoplay=autoplay),
+        _browser_speech_html(content, language_code, voice_tone=voice_tone, autoplay=autoplay),
         height=44,
     )
 
@@ -685,12 +788,16 @@ def _queue_voice_transcript(transcript, voice_mode):
 def _render_microphone(voice_language, voice_mode):
     language_code = normalize_voice_language(voice_language, st.session_state.chat_draft)
 
+    # Short, clear prompts for recorder components (avoid emoji images)
+    start_prompt_text = "Mic"
+    stop_prompt_text = "Listening..."
+
     if speech_to_text is not None and not whisper_stt_enabled():
         try:
             transcript = speech_to_text(
                 language=language_code,
-                start_prompt="🎤",
-                stop_prompt="🎤 Listening...",
+                start_prompt=start_prompt_text,
+                stop_prompt=stop_prompt_text,
                 just_once=True,
                 use_container_width=True,
                 key="csc_web_speech",
@@ -698,8 +805,8 @@ def _render_microphone(voice_language, voice_mode):
         except TypeError:
             transcript = speech_to_text(
                 language=language_code,
-                start_prompt="🎤",
-                stop_prompt="🎤 Listening...",
+                start_prompt=start_prompt_text,
+                stop_prompt=stop_prompt_text,
                 just_once=True,
                 key="csc_web_speech",
             )
@@ -710,16 +817,16 @@ def _render_microphone(voice_language, voice_mode):
     if whisper_stt_enabled() and mic_recorder is not None:
         try:
             audio = mic_recorder(
-                start_prompt="🎤",
-                stop_prompt="🎤 Listening...",
+                start_prompt=start_prompt_text,
+                stop_prompt=stop_prompt_text,
                 just_once=True,
                 use_container_width=True,
                 key="csc_whisper_recorder",
             )
         except TypeError:
             audio = mic_recorder(
-                start_prompt="🎤",
-                stop_prompt="🎤 Listening...",
+                start_prompt=start_prompt_text,
+                stop_prompt=stop_prompt_text,
                 just_once=True,
                 key="csc_whisper_recorder",
             )
@@ -741,8 +848,8 @@ def _render_microphone(voice_language, voice_mode):
         try:
             transcript = speech_to_text(
                 language=language_code,
-                start_prompt="🎤",
-                stop_prompt="🎤 Listening...",
+                start_prompt=start_prompt_text,
+                stop_prompt=stop_prompt_text,
                 just_once=True,
                 use_container_width=True,
                 key="csc_web_speech",
@@ -750,8 +857,8 @@ def _render_microphone(voice_language, voice_mode):
         except TypeError:
             transcript = speech_to_text(
                 language=language_code,
-                start_prompt="🎤",
-                stop_prompt="🎤 Listening...",
+                start_prompt=start_prompt_text,
+                stop_prompt=stop_prompt_text,
                 just_once=True,
                 key="csc_web_speech",
             )
@@ -759,7 +866,7 @@ def _render_microphone(voice_language, voice_mode):
             _queue_voice_transcript(transcript, voice_mode)
         return
 
-    st.button("🎤", disabled=True, use_container_width=True, help="Microphone input needs streamlit-mic-recorder.")
+    st.button("Mic", disabled=True, use_container_width=True, help="Microphone input needs streamlit-mic-recorder.")
 
 
 def _render_composer(voice_language, voice_mode):
@@ -791,10 +898,8 @@ def _render_composer(voice_language, voice_mode):
         _render_microphone(voice_language, voice_mode)
 
     with mode_col:
-        mode_label = "🎤 Voice Mode ON" if st.session_state.voice_mode else "🎤 Voice Mode OFF"
-        if st.button(mode_label, use_container_width=True, key="inline_voice_mode"):
-            st.session_state.voice_mode = not st.session_state.voice_mode
-            st.rerun()
+        # Use a simple toggle checkbox for voice mode instead of an on/off button
+        st.checkbox("Voice Mode", key="voice_mode", help="Toggle voice mode on or off")
 
     if admin_visible:
         with attach_col:
